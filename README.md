@@ -1,19 +1,14 @@
 # dynamic_dumstack
 
-Name - Rachana Bhaskar
-ASU ID - 1217402615
+Exercise Objectives
+1. To learn the basic programming technique in Linux kernel.
+2. To practice the mechanisms and data structures of system call, and other Linux kernel objects
+
+Linux kernel dump_stack() function can give a call trace from process stack. To enable dump_stack() function, the kernel must be built with certain config options enabled. Then, dump_stack() function is inserted into source code and can get invoked at execution time.
+
+In this assignment, two new syscalls are implemented to insert and remove dump_stack in the execution path of kernel programs. In other words, the insertion and deletion of dump_stack is done dynamically, without re-building the kernel. The basic technique is to use kprobe to invoke dump_stack() in a pre-handler.
 
 
-///////////////////////////////////////////////////////////
-
-files included:
-
-Makefile
-trail.patch
-main.c
-readme.txt
-
-///////////////////////////////////////////////////////////
 
 Instructions to run - 
 
