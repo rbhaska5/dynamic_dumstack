@@ -1,0 +1,369 @@
+diff -uNr kernel/arch/x86/syscalls/syscall_32.tbl kernel2/arch/x86/syscalls/syscall_32.tbl
+--- kernel/arch/x86/syscalls/syscall_32.tbl	2017-06-17 10:44:31.000000000 -0700
++++ kernel2/arch/x86/syscalls/syscall_32.tbl	2020-05-08 10:53:46.440137184 -0700
+@@ -365,3 +365,5 @@
+ 356	i386	memfd_create		sys_memfd_create
+ 357	i386	bpf			sys_bpf
+ 358	i386	execveat		sys_execveat			stub32_execveat
++359	i386	insdump			sys_insdump
++360	i386	rmdump			sys_rmdump
+diff -uNr kernel/kernel/exit.c kernel2/kernel/exit.c
+--- kernel/kernel/exit.c	2017-06-17 10:44:58.000000000 -0700
++++ kernel2/kernel/exit.c	2020-05-08 10:55:12.316128574 -0700
+@@ -59,6 +59,8 @@
+ #include <asm/pgtable.h>
+ #include <asm/mmu_context.h>
+ 
++extern void probe_remove(int);
++
+ static void exit_mm(struct task_struct *tsk);
+ 
+ static void __unhash_process(struct task_struct *p, bool group_dead)
+@@ -655,6 +657,11 @@
+ 	int group_dead;
+ 	TASKS_RCU(int tasks_rcu_i);
+ 
++#ifdef CONFIG_DYNAMIC_DUMP_STACK
++	//pr_info("Function removing all probes from do_exit\n");
++	probe_remove(tsk->pid);
++#endif
++
+ 	profile_task_exit(tsk);
+ 
+ 	WARN_ON(blk_needs_flush_plug(tsk));
+diff -uNr kernel/lib/dynamic_dump_stack.c kernel2/lib/dynamic_dump_stack.c
+--- kernel/lib/dynamic_dump_stack.c	1969-12-31 17:00:00.000000000 -0700
++++ kernel2/lib/dynamic_dump_stack.c	2020-05-08 09:16:59.514346000 -0700
+@@ -0,0 +1,305 @@
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/kprobes.h>
++#include <linux/slab.h>
++#include <linux/cdev.h>
++#include <linux/sched.h>
++#include <linux/types.h>
++#include <linux/syscalls.h>
++#include <linux/fs.h>
++#include <linux/device.h>
++#include <linux/init.h>
++#include <linux/uaccess.h>
++#include <linux/string.h>
++#include <linux/kallsyms.h>
++//#include "dynamic_dump_stack.h"
++
++#define LENGTH_SYMBOL	64
++
++struct list_head dump_stack_list = LIST_HEAD_INIT(dump_stack_list);   //dump stack list initialized
++struct dump_stack{
++	struct kprobe kp;
++	int dumpmode;
++	struct list_head dumplist;
++	int pid;
++	int ppid;
++	int tgid;
++	int ref_id_stack;
++};
++struct dumpmode_t{
++	unsigned int mode;
++};
++static DEFINE_SPINLOCK(mylist_lock);
++int dumpid_count = 0;
++
++// static int kprobecall(void);
++//extern int probe_search(void);
++
++// int count;
++
++// struct dump_dev{   //added to check dump stack operations using cdev initially
++// 	struct cdev cdev;
++// }*dump_devp;
++//
++// static int dev_major = 0;
++// static struct class *dump_class;
++
++/*...................................................................
++
++
++//dump mode conditions---------------------
++//dump mode = 0, dump_stack operation is enabled for the owner process
++//dump mode = 1, dump_stack operation is enabled for processes with same owner process
++//dump mode other than 0 or 1, dump_stack operation is enabled for all processes
++
++..................................................................*/
++#ifdef CONFIG_DYNAMIC_DUMP_STACK
++/// kprobe pre_handler - called before the probed instruction is executed
++static int handler_pre(struct kprobe *p, struct pt_regs *regs)
++{
++
++	struct dump_stack *new_struct;
++	struct task_struct* this_process = current;
++	// pid_t pid;
++	// pid = this_process->pid;
++
++	new_struct = container_of(p, struct dump_stack, kp);
++	printk("<%s> Inside pre_handler - p->addr = 0x%p\n",	p->symbol_name, p->addr);
++	if(new_struct->dumpmode == 0){
++		//printk("dump mode = 0 loop entered....\n");
++		//printk("checking PID number from struct....%d\n",new_struct->pid);
++	//	printk("current pid = %d\n",this_process->pid);
++		if(this_process->pid == new_struct->pid || this_process->tgid == new_struct->tgid){
++			printk("Dump stack operation enabled for owner process (mode=0)..........\n");
++			dump_stack();
++		}
++	}
++	else if(new_struct->dumpmode == 1){
++		if((task_ppid_nr(this_process) == new_struct->ppid) || (current->tgid == new_struct->tgid)){
++			printk("dump stack for processes with same parent process (mode = 1)......\n");
++			dump_stack();
++		}
++	}
++
++	else {
++		printk("dump stack for all processes...\n");
++		dump_stack();
++	}
++
++	return 0;
++}
++
++//function to remove all dump stack operations on exit
++void probe_remove(int pid){
++	int check = 0;
++	int ret;
++	struct dump_stack *dump_current;
++	struct list_head* list_dummy;
++	list_for_each(list_dummy, &dump_stack_list){
++		dump_current = list_entry(list_dummy, struct dump_stack, dumplist);
++		if (dump_current->pid == pid) {
++			check =1;
++			break;
++		}
++	}
++	if(check==1){
++		printk("removing dumpid = %d\n",dump_current->ref_id_stack);
++		//protecting
++		spin_lock(&mylist_lock);
++		list_del(list_dummy);
++		spin_unlock(&mylist_lock);
++		printk("All dump stack operations removed successfully on exit\n");
++		unregister_kprobe(&dump_current->kp);
++		if(ret<0)
++		printk("error in unregistering kprobe  \n");
++		kfree(dump_current);
++	}
++
++}
++EXPORT_SYMBOL_GPL(probe_remove);
++#endif
++
++// // kprobe post_handler - called after the probed instruction is executed
++// static void handler_post(struct kprobe *p, struct pt_regs *regs,unsigned long flags)
++// {
++// 	printk("Post handler entered \n");
++// 	printk("<%s> post_handler -  p->addr = 0x%p\n",p->symbol_name, p->addr);
++// }
++//
++//
++// static int handler_fault(struct kprobe *p, struct pt_regs *regs, int trapnr)
++// {
++// 	printk("Fault handler\n");
++// 	printk("fault_handler -  p->addr = 0x%p, trap #%dn", p->addr, trapnr);
++//
++// 	return 0;
++// }
++
++// static int dump_open(struct itemp *itemp, struct file *file)
++// {
++// 	printk("Device open\n");
++//
++// 	kprobecall();
++// 	probe_search();
++// 	printk("kprobe call endddddddd....\n");
++// 	return 0;
++// }
++//
++// static int dump_release(struct itemp *itemp, struct file *file)
++// {
++// 	printk("Device close\n");
++// 	return 0;
++// }
++
++
++SYSCALL_DEFINE1(rmdump, unsigned int, dumpid){
++
++#ifdef CONFIG_DYNAMIC_DUMP_STACK
++
++	struct list_head* list_dummy = NULL;
++	struct dump_stack* dump_current = NULL;
++	int ret;
++	struct task_struct* this_process = current;
++	// pid_t pid = this_process->pid;
++	int check = 0;
++
++	list_for_each(list_dummy, &dump_stack_list){
++		//	if(count > 0){
++		//printk("entered list for each.....\n");
++		dump_current = list_entry(list_dummy, struct dump_stack, dumplist);
++		// printk("dump stack id = %d\n", dump_current->ref_id_stack);
++		// printk("dump id given  = %d\n", dumpid);
++		// printk("pid taken from task .... = %d\n", pid);
++		// printk("pid from struct  = %d\n", dump_current->pid);
++
++		if((dump_current->ref_id_stack == dumpid) && (dump_current->pid == this_process->pid)){
++			//	printk("struct pid entered......\n");
++			check = 1;
++			// dumpid--;
++			// ref_id_stack--;
++			break;
++		}
++	}
++	// printk("out from print for each\n");
++	if(check==1){
++		printk("Dump stack exists; Removed dumpstack for dumpid = %d\n",dumpid);
++		spin_lock(&mylist_lock);
++		list_del(list_dummy);
++		spin_unlock(&mylist_lock);
++		unregister_kprobe(&dump_current->kp);
++		if(ret<0)
++		printk("error in unregistering kprobe  \n");
++		kfree(dump_current);
++		//dumpid_count = 0;
++		return 0;
++	}
++
++	else{
++		printk("Failed to find dump stack..\n");
++		return -EINVAL;
++	}
++	return 1;
++
++#else
++	return 0;
++#endif
++
++}
++
++SYSCALL_DEFINE2(insdump,const char __user *, symbolname,struct dumpmode_t __user*, mode)
++{
++
++	#ifdef CONFIG_DYNAMIC_DUMP_STACK
++	//printk("kprobe call entered..\n");
++
++	int ret;
++	int user;
++	//struct list_head* list_dummy;
++	struct dumpmode_t mode_from_user;
++	struct task_struct* this_process = current;
++	struct dump_stack* temp = kmalloc(sizeof(struct dump_stack),GFP_KERNEL);
++	if(temp == NULL){
++		printk("kmalloc error....");
++		return -ENOMEM;
++	}
++	memset(temp, 0, sizeof(struct dump_stack));
++
++	temp->pid = this_process->pid;
++	temp->ppid = task_ppid_nr(this_process);
++	temp->tgid = this_process->tgid;
++	printk("INSDUMP ... temp PID number....%d\n",temp->pid);
++
++	user = copy_from_user(&mode_from_user, mode,sizeof(mode_from_user));
++	printk("Dump mode from user - %d\n", mode_from_user.mode);
++	temp->dumpmode = mode_from_user.mode;
++	//memset(&temp->kp, 0, sizeof(struct kprobe));
++
++	//symbol_name = kmalloc(sizeof(char)*LENGTH_SYMBOL, GFP_KERNEL);
++	//strncpy_from_user((char *)symbol_name,symbolname, LENGTH_SYMBOL);
++	//printk("Symbol name copied from the user\n");
++	temp->kp.addr = (kprobe_opcode_t *)kallsyms_lookup_name(symbolname);
++
++	temp->kp.pre_handler = handler_pre;
++	// temp->kp.post_handler = handler_post;
++	// temp->kp.fault_handler = handler_fault;
++	temp->ref_id_stack = dumpid_count++;
++
++	ret = register_kprobe(&temp->kp);
++	if (ret < 0) {
++		printk("Register_kprobe failed, returned %d\n", ret);
++		return ret;
++	}
++	printk("Planted kprobe at %p = and dump id = %d\n", temp->kp.addr,temp->dumpmode);
++
++	spin_lock(&mylist_lock);
++	list_add(&temp->dumplist, &dump_stack_list);
++	spin_unlock(&mylist_lock);
++
++	return(temp->ref_id_stack);
++	#else
++		return 0;
++	#endif
++}
++
++
++// static const struct file_operations mydump_fops = {
++// 	.owner      = THIS_MODULE,
++// 	.open       = dump_open,
++// 	.release    = dump_release,
++//
++// };
++
++// static int __init kprobe_init(void)
++// {
++// 	printk("dump module initialized........\n");
++//
++// 	int res;
++// 	dev_t dev;
++//
++//
++// 	res = alloc_chrdev_region(&dev, 0, 1, "mydump");
++// 	dev_major = MAJOR(dev);
++//
++// 	dump_class = class_create(THIS_MODULE, "mydump");
++// 	dump_devp = kmalloc(sizeof(struct dump_dev), GFP_KERNEL);
++//
++// 	cdev_init(&dump_devp->cdev, &mydump_fops);
++// 	// dump_devp->cdev->owner = THIS_MODULE;
++// 	cdev_add(&dump_devp->cdev, MKDEV(dev_major, 0), 1);
++// 	device_create(dump_class, NULL, MKDEV(dev_major, 0), NULL, "mydump");
++// 	return 0;
++// }
++//
++// static void __exit kprobe_exit(void)
++// {
++
++// 	device_destroy(dump_class, MKDEV(dev_major, 0));
++// 	class_unregister(dump_class);
++// 	class_destroy(dump_class);
++//
++// 	unregister_chrdev_region(MKDEV(dev_major, 0), MINORMASK);
++// }
++//
++// module_init(kprobe_init)
++// module_exit(kprobe_exit)
++// MODULE_LICENSE("GPL");
+diff -uNr kernel/lib/Kconfig.debug kernel2/lib/Kconfig.debug
+--- kernel/lib/Kconfig.debug	2017-06-17 10:44:58.000000000 -0700
++++ kernel2/lib/Kconfig.debug	2020-05-08 10:51:41.456244024 -0700
+@@ -1,5 +1,11 @@
+ menu "printk and dmesg options"
+ 
++config DYNAMIC_DUMP_STACK
++	bool "To enable dynamic dump stack"
++	default y
++	help
++	  Set it to y to enable and n to disable dynamic dump stack
++	  
+ config PRINTK_TIME
+ 	bool "Show timing information on printks"
+ 	depends on PRINTK
+diff -uNr kernel/lib/Makefile kernel2/lib/Makefile
+--- kernel/lib/Makefile	2017-06-17 10:44:58.000000000 -0700
++++ kernel2/lib/Makefile	2020-05-08 10:52:35.200182939 -0700
+@@ -117,6 +117,8 @@
+ 
+ obj-$(CONFIG_DYNAMIC_DEBUG) += dynamic_debug.o
+ 
++obj-$(CONFIG_DYNAMIC_DUMP_STACK) += dynamic_dump_stack.o
++
+ obj-$(CONFIG_NLATTR) += nlattr.o
+ 
+ obj-$(CONFIG_LRU_CACHE) += lru_cache.o
